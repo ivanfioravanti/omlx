@@ -310,6 +310,7 @@ class HFDownloadRequest(BaseModel):
     """Request model for starting a HuggingFace model download."""
 
     repo_id: str
+    revision: str = ""
     hf_token: str = ""
 
 
@@ -5114,7 +5115,11 @@ async def start_hf_download(
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
     try:
-        task = await _hf_downloader.start_download(request.repo_id, request.hf_token)
+        task = await _hf_downloader.start_download(
+            repo_id=request.repo_id,
+            hf_token=request.hf_token,
+            revision=request.revision,
+        )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -5265,6 +5270,7 @@ async def search_hf_models(
 @router.get("/api/hf/model-info")
 async def get_hf_model_info(
     repo_id: str = "",
+    revision: str = "",
     is_admin: bool = Depends(require_admin),
 ):
     """Get detailed model information from HuggingFace."""
@@ -5278,8 +5284,13 @@ async def get_hf_model_info(
     from .hf_downloader import HFDownloader
 
     try:
-        result = await HFDownloader.get_model_info(repo_id=repo_id.strip())
+        result = await HFDownloader.get_model_info(
+            repo_id=repo_id.strip(),
+            revision=revision.strip(),
+        )
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except TimeoutError:
         raise HTTPException(
             status_code=504,

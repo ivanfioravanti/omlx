@@ -251,7 +251,7 @@
                                         <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">{{ t('models.downloader.repo_id') }}</label>
                                         <input type="text" x-model="hfRepoId"
                                                @keydown.enter="startHFDownload()"
-                                               placeholder="mlx-community/Llama-3-8B-4bit"
+                                               placeholder="owner/model or https://huggingface.co/owner/model/tree/revision"
                                                class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm
                                                       focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all
                                                       bg-white font-mono text-xs"
@@ -788,7 +788,8 @@
                                             <div class="flex items-center justify-between">
                                                 <div class="flex-1 min-w-0">
                                                     <div class="flex items-center gap-2 flex-wrap">
-                                                        <span class="text-sm font-medium text-neutral-900 truncate" x-text="task.repo_id"></span>
+                                                        <span class="text-sm font-medium text-neutral-900 truncate"
+                                                              x-text="task.revision ? task.repo_id + '@' + task.revision : task.repo_id"></span>
                                                         <span class="px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider rounded-full shrink-0"
                                                               :class="{
                                                                   'bg-blue-50 text-blue-700 border border-blue-200': task.status === 'downloading',

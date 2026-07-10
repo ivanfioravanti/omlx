@@ -15,14 +15,14 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import huggingface_hub.constants as _hf_constants
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
-    EntryNotFoundError,
     GatedRepoError,
     RepositoryNotFoundError,
+    RevisionNotFoundError,
 )
 from huggingface_hub.utils import tqdm as _hf_tqdm
 
@@ -50,6 +50,89 @@ _STALL_TIMEOUT = 300
 # so downloads fail. We resolve the redirect chain upfront and pin HfApi to
 # the final origin.
 _endpoint_resolution_cache: dict[str, str] = {}
+
+
+def _parse_hf_repo_reference(
+    repo_reference: str,
+    revision: str = "",
+) -> tuple[str, str]:
+    """Normalize a Hub repo ID or ``/tree/<revision>`` URL.
+
+    The downloader UI accepts both the traditional ``owner/model`` form and
+    links copied from the Hugging Face file browser, for example::
+
+        https://huggingface.co/owner/model/tree/feature%2Fbranch
+
+    An explicitly supplied revision is useful for API clients.  If both the
+    URL and the request specify one, they must agree so the selected snapshot
+    is never ambiguous.
+    """
+    raw_reference = repo_reference.strip()
+    requested_revision = revision.strip()
+    url_revision = ""
+
+    if "://" in raw_reference:
+        parsed = urlparse(raw_reference)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(f"Invalid Hugging Face URL: '{raw_reference}'")
+        if parsed.hostname not in (
+            "huggingface.co",
+            "www.huggingface.co",
+            "hf.co",
+        ):
+            raise ValueError(
+                f"Invalid Hugging Face URL: '{raw_reference}'. "
+                "Expected a huggingface.co repository URL"
+            )
+
+        path_parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if len(path_parts) < 2:
+            raise ValueError(
+                f"Invalid Hugging Face URL: '{raw_reference}'. "
+                "Expected 'https://huggingface.co/owner/model'"
+            )
+
+        repo_id = "/".join(path_parts[:2])
+        if len(path_parts) > 2:
+            if path_parts[2] != "tree" or len(path_parts) < 4:
+                raise ValueError(
+                    f"Invalid Hugging Face URL: '{raw_reference}'. "
+                    "Expected a repository URL or '/tree/<revision>' URL"
+                )
+            url_revision = "/".join(path_parts[3:]).strip()
+            if not url_revision:
+                raise ValueError(
+                    f"Invalid Hugging Face URL: '{raw_reference}'. "
+                    "The tree revision cannot be empty"
+                )
+    else:
+        repo_id = raw_reference
+
+    repo_parts = repo_id.split("/")
+    if (
+        len(repo_parts) != 2
+        or not all(repo_parts)
+        or any(part in (".", "..") for part in repo_parts)
+    ):
+        raise ValueError(
+            f"Invalid repository ID: '{repo_id}'. "
+            "Expected 'owner/model' or a Hugging Face repository URL"
+        )
+
+    if (
+        requested_revision
+        and url_revision
+        and requested_revision != url_revision
+    ):
+        raise ValueError(
+            "Conflicting Hugging Face revisions: "
+            f"URL selects '{url_revision}' but request selects '{requested_revision}'"
+        )
+
+    resolved_revision = requested_revision or url_revision
+    if "\x00" in resolved_revision:
+        raise ValueError("Invalid Hugging Face revision")
+    return repo_id, resolved_revision
 
 
 def _resolve_endpoint(endpoint: str) -> str:
@@ -184,6 +267,7 @@ class DownloadTask:
 
     task_id: str
     repo_id: str
+    revision: str = ""
     status: DownloadStatus = DownloadStatus.PENDING
     progress: float = 0.0
     total_size: int = 0
@@ -199,6 +283,7 @@ class DownloadTask:
         return {
             "task_id": self.task_id,
             "repo_id": self.repo_id,
+            "revision": self.revision,
             "status": self.status.value,
             "progress": round(self.progress, 1),
             "total_size": self.total_size,
@@ -474,20 +559,24 @@ class HFDownloader:
         }
 
     @staticmethod
-    async def get_model_info(repo_id: str) -> dict:
+    async def get_model_info(repo_id: str, revision: str = "") -> dict:
         """Fetch detailed model information from HuggingFace.
 
         Args:
-            repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
+            repo_id: HuggingFace repository ID or ``/tree/<revision>`` URL.
+            revision: Optional branch, tag, or commit. A revision embedded in
+                ``repo_id`` is used when this is empty.
 
         Returns:
             Dict with model details including description, files, tags, etc.
         """
+        repo_id, revision = _parse_hf_repo_reference(repo_id, revision)
         api, endpoint = _get_hf_api()
         info = await asyncio.wait_for(
             asyncio.to_thread(
                 api.model_info,
                 repo_id,
+                revision=revision or None,
                 files_metadata=True,
             ),
             timeout=_HF_API_TIMEOUT,
@@ -530,6 +619,7 @@ class HFDownloader:
                     hf_hub_download,
                     repo_id=repo_id,
                     filename="README.md",
+                    revision=revision or None,
                     endpoint=endpoint,
                 ),
                 timeout=_HF_API_TIMEOUT,
@@ -547,6 +637,7 @@ class HFDownloader:
 
         return {
             "repo_id": info.id,
+            "revision": revision,
             "name": info.id,
             "model_card": model_card,
             "description": "",  # kept for backward compat
@@ -588,13 +679,18 @@ class HFDownloader:
         self._model_dir = Path(new_dir)
 
     async def start_download(
-        self, repo_id: str, hf_token: str = ""
+        self,
+        repo_id: str,
+        hf_token: str = "",
+        revision: str = "",
     ) -> DownloadTask:
         """Start downloading a model from HuggingFace.
 
         Args:
-            repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
+            repo_id: HuggingFace repository ID or ``/tree/<revision>`` URL.
             hf_token: Optional HuggingFace token for gated models.
+            revision: Optional branch, tag, or commit. A revision embedded in
+                ``repo_id`` is used when this is empty.
 
         Returns:
             The created DownloadTask.
@@ -602,12 +698,7 @@ class HFDownloader:
         Raises:
             ValueError: If repo_id format is invalid or download is already queued.
         """
-        repo_id = repo_id.strip()
-        if "/" not in repo_id or len(repo_id.split("/")) != 2:
-            raise ValueError(
-                f"Invalid repository ID: '{repo_id}'. "
-                "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"
-            )
+        repo_id, revision = _parse_hf_repo_reference(repo_id, revision)
 
         # Check for duplicate active downloads
         for task in self._tasks.values():
@@ -620,7 +711,7 @@ class HFDownloader:
                 )
 
         task_id = str(uuid.uuid4())
-        task = DownloadTask(task_id=task_id, repo_id=repo_id)
+        task = DownloadTask(task_id=task_id, repo_id=repo_id, revision=revision)
         self._tasks[task_id] = task
 
         # Start download in background
@@ -628,7 +719,8 @@ class HFDownloader:
             self._run_download(task_id, hf_token)
         )
 
-        logger.info(f"Download queued: {repo_id} (task_id={task_id})")
+        display_ref = f"{repo_id}@{revision}" if revision else repo_id
+        logger.info(f"Download queued: {display_ref} (task_id={task_id})")
         return task
 
     async def cancel_download(self, task_id: str) -> bool:
@@ -712,6 +804,7 @@ class HFDownloader:
             )
 
         repo_id = old_task.repo_id
+        revision = old_task.revision
         old_retry_count = old_task.retry_count
 
         # Remove old task entry
@@ -719,7 +812,7 @@ class HFDownloader:
         self._cancelled.discard(task_id)
 
         # Start fresh download (snapshot_download resumes from existing files)
-        new_task = await self.start_download(repo_id, hf_token)
+        new_task = await self.start_download(repo_id, hf_token, revision)
         new_task.retry_count = old_retry_count + 1
         return new_task
 
@@ -760,6 +853,9 @@ class HFDownloader:
         thread while polling the target directory for progress updates.
         """
         task = self._tasks[task_id]
+        display_ref = (
+            f"{task.repo_id}@{task.revision}" if task.revision else task.repo_id
+        )
 
         try:
             async with self._download_sem:
@@ -785,6 +881,7 @@ class HFDownloader:
                         asyncio.to_thread(
                             api.model_info,
                             task.repo_id,
+                            revision=task.revision or None,
                             token=hf_token or None,
                             expand=["safetensors"],
                         ),
@@ -800,7 +897,7 @@ class HFDownloader:
                         ]
                 except Exception as e:
                     logger.warning(
-                        f"Could not fetch repo info for {task.repo_id}: {e}"
+                        f"Could not fetch repo info for {display_ref}: {e}"
                     )
 
                 dl_kwargs: dict = {
@@ -810,6 +907,8 @@ class HFDownloader:
                     "endpoint": endpoint,
                     "etag_timeout": 30,
                 }
+                if task.revision:
+                    dl_kwargs["revision"] = task.revision
                 if ignore_patterns:
                     dl_kwargs["ignore_patterns"] = ignore_patterns
 
@@ -827,7 +926,7 @@ class HFDownloader:
                     task.total_size = sum(f.file_size for f in dry_result)
                 except Exception as e:
                     logger.warning(
-                        f"Dry run failed for {task.repo_id}: {e}. "
+                        f"Dry run failed for {display_ref}: {e}. "
                         "Progress estimation will be unavailable."
                     )
 
@@ -861,7 +960,7 @@ class HFDownloader:
                 task.completed_at = time.time()
 
                 logger.info(
-                    f"Download completed: {task.repo_id} -> {target_dir} "
+                    f"Download completed: {display_ref} -> {target_dir} "
                     f"({time.time() - task.started_at:.1f}s)"
                 )
 
@@ -886,25 +985,32 @@ class HFDownloader:
                 logger.error(
                     f"Failed to clean up cancelled download {task.repo_id}: {e}"
                 )
+        except RevisionNotFoundError:
+            task.status = DownloadStatus.FAILED
+            task.error = (
+                f"Revision '{task.revision}' was not found for "
+                f"repository '{task.repo_id}'."
+            )
+            logger.error(f"Revision not found: {display_ref}")
         except RepositoryNotFoundError:
             task.status = DownloadStatus.FAILED
             task.error = (
-                f"Repository not found: {task.repo_id}. "
+                f"Repository or revision not found: {display_ref}. "
                 "This may be a gated model that requires HuggingFace authentication."
             )
-            logger.error(f"Repository not found: {task.repo_id}")
+            logger.error(f"Repository or revision not found: {display_ref}")
         except GatedRepoError:
             task.status = DownloadStatus.FAILED
             task.error = (
-                f"Repository '{task.repo_id}' is gated. "
+                f"Repository '{display_ref}' is gated. "
                 "Please provide a valid HF token with access."
             )
-            logger.error(f"Gated repo access denied: {task.repo_id}")
+            logger.error(f"Gated repo access denied: {display_ref}")
         except Exception as e:
             if task_id not in self._cancelled:
                 task.status = DownloadStatus.FAILED
                 task.error = str(e)
-                logger.error(f"Download failed for {task.repo_id}: {e}")
+                logger.error(f"Download failed for {display_ref}: {e}")
         finally:
             # Stop progress polling
             progress_task = self._progress_tasks.pop(task_id, None)

@@ -9,6 +9,7 @@ struct HFTaskListResponse: Codable, Sendable {
 struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
     let taskId: String
     let repoId: String
+    let revision: String?
     let status: String
     let progress: Double
     let totalSize: Int64
@@ -20,6 +21,10 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
     let retryCount: Int
 
     var id: String { taskId }
+    var displayReference: String {
+        guard let revision, !revision.isEmpty else { return repoId }
+        return "\(repoId)@\(revision)"
+    }
 
     enum Status: String {
         case pending, downloading, completed, failed, cancelled, paused
@@ -33,6 +38,7 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
 
 struct StartHFDownloadRequest: Encodable, Sendable {
     let repoId: String
+    let revision: String?
     let hfToken: String
 }
 

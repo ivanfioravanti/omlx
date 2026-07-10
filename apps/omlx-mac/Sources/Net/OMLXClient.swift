@@ -198,9 +198,13 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.hfTasks)
     }
 
-    func startHFDownload(repoId: String, hfToken: String = "") async throws -> StartHFDownloadResponse {
+    func startHFDownload(
+        repoId: String,
+        revision: String? = nil,
+        hfToken: String = ""
+    ) async throws -> StartHFDownloadResponse {
         try await post(AdminAPI.hfDownload, body: StartHFDownloadRequest(
-            repoId: repoId, hfToken: hfToken
+            repoId: repoId, revision: revision, hfToken: hfToken
         ))
     }
 

@@ -203,7 +203,7 @@ private struct AddFromHFSection: View {
                     HStack(spacing: 8) {
                         TextInput(
                             text: $repoText,
-                            placeholder: "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                            placeholder: "owner/model or https://huggingface.co/owner/model/tree/revision",
                             mono: true
                         )
                         .frame(maxWidth: .infinity)
@@ -637,7 +637,7 @@ private struct ActiveDownloadsSection: View {
                                 Image(systemName: "icloud.and.arrow.down")
                                     .font(.system(size: 12))
                                     .foregroundStyle(theme.blueDot)
-                                Text(task.repoId)
+                                Text(task.displayReference)
                                     .font(.omlxMono(12))
                                     .foregroundStyle(theme.text)
                                     .lineLimit(1)
@@ -744,7 +744,7 @@ private struct CompletedTasksSection: View {
                     FreeRow(isLast: idx == tasks.count - 1) {
                         HStack(spacing: 8) {
                             StatusChip(task: task)
-                            Text(task.repoId)
+                            Text(task.displayReference)
                                 .font(.omlxMono(12))
                                 .foregroundStyle(theme.text)
                                 .lineLimit(1)

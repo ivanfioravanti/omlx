@@ -16,6 +16,7 @@ from omlx.admin.hf_downloader import (
     HFDownloader,
     _DownloadCancelled,
     _make_cancellable_tqdm,
+    _parse_hf_repo_reference,
 )
 
 
@@ -31,6 +32,7 @@ class TestDownloadTask:
         task = DownloadTask(task_id="test-id", repo_id="owner/model")
         assert task.task_id == "test-id"
         assert task.repo_id == "owner/model"
+        assert task.revision == ""
         assert task.status == DownloadStatus.PENDING
         assert task.progress == 0.0
         assert task.total_size == 0
@@ -56,6 +58,7 @@ class TestDownloadTask:
         d = task.to_dict()
         assert d["task_id"] == "abc-123"
         assert d["repo_id"] == "mlx-community/Llama-3-8B"
+        assert d["revision"] == ""
         assert d["status"] == "downloading"
         assert d["progress"] == 45.7  # rounded to 1 decimal
         assert d["total_size"] == 1000000
@@ -90,6 +93,45 @@ class TestHFDownloader:
         return HFDownloader(model_dir=str(model_dir))
 
     # --- Start Download ---
+
+    @pytest.mark.parametrize(
+        ("reference", "revision", "expected"),
+        [
+            ("owner/model", "", ("owner/model", "")),
+            (
+                "https://huggingface.co/example-org/example-model/tree/test-revision",
+                "",
+                ("example-org/example-model", "test-revision"),
+            ),
+            (
+                "https://huggingface.co/owner/model/tree/feature%2Fmlx",
+                "",
+                ("owner/model", "feature/mlx"),
+            ),
+            ("owner/model", "refs/pr/42", ("owner/model", "refs/pr/42")),
+        ],
+    )
+    def test_parse_repo_reference(self, reference, revision, expected):
+        assert _parse_hf_repo_reference(reference, revision) == expected
+
+    @pytest.mark.parametrize(
+        "reference",
+        [
+            "https://example.com/owner/model/tree/main",
+            "https://huggingface.co/owner/model/blob/main/config.json",
+            "https://huggingface.co/owner/model/tree/",
+        ],
+    )
+    def test_parse_repo_reference_rejects_invalid_urls(self, reference):
+        with pytest.raises(ValueError, match="Invalid Hugging Face URL"):
+            _parse_hf_repo_reference(reference)
+
+    def test_parse_repo_reference_rejects_conflicting_revision(self):
+        with pytest.raises(ValueError, match="Conflicting Hugging Face revisions"):
+            _parse_hf_repo_reference(
+                "https://huggingface.co/owner/model/tree/feature-branch",
+                "main",
+            )
 
     @pytest.mark.asyncio
     async def test_start_download_creates_task(self, downloader):
@@ -141,6 +183,32 @@ class TestHFDownloader:
 
             task = await downloader.start_download("  owner/model  ")
             assert task.repo_id == "owner/model"
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_tree_url_download_passes_revision_to_hub(self, downloader):
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_api.model_info.return_value = mock_info
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+        ) as mock_download:
+            task = await downloader.start_download(
+                "https://huggingface.co/example-org/example-model/tree/test-revision"
+            )
+            await asyncio.sleep(0.5)
+
+            assert task.repo_id == "example-org/example-model"
+            assert task.revision == "test-revision"
+            assert task.to_dict()["revision"] == "test-revision"
+            assert mock_api.model_info.call_args.kwargs["revision"] == "test-revision"
+            assert mock_download.call_args.kwargs["revision"] == "test-revision"
 
             await downloader.shutdown()
 
@@ -2095,6 +2163,32 @@ class TestRetryDownload:
             new_task = await downloader.retry_download(old_task_id)
             assert new_task.repo_id == "owner/model"
             assert new_task.retry_count == 1
+
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_retry_preserves_revision(self, downloader):
+        """Retrying a tree-URL download must select the same Hub snapshot."""
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download"
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.safetensors = {}
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            task = await downloader.start_download(
+                "https://huggingface.co/owner/model/tree/feature-branch"
+            )
+            await asyncio.sleep(0.1)
+            task.status = DownloadStatus.FAILED
+
+            retried = await downloader.retry_download(task.task_id)
+            assert retried.repo_id == "owner/model"
+            assert retried.revision == "feature-branch"
 
             await downloader.shutdown()
 

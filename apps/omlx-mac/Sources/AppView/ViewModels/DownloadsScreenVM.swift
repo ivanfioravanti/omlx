@@ -270,6 +270,13 @@ final class DownloadsScreenVM {
         if q == lastSearchQuery && !searchResults.isEmpty {
             return
         }
+        if q.hasPrefix("https://") || q.hasPrefix("http://") {
+            // A copied Hub tree URL is already an exact download target;
+            // don't send the full URL through model search autocomplete.
+            searchResults = []
+            searchLoading = false
+            return
+        }
         if q.count < 2 {
             // Too short to be useful — wait for more characters.
             return
